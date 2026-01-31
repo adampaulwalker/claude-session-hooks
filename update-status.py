@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Stop hook: Generate session summary, update STATUS.md, optionally auto-commit.
+
+Called when Claude Code session ends:
+1. Generates a session summary from activity log
+2. Updates .claude/STATUS.md with the summary
+3. Archives activity log to .claude/logs/
+4. Optionally runs git auto-commit (if GIT_AUTO_COMMIT=1)
+"""
+
+import json
+import sys
+import os
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+
+def get_claude_dir() -> Path:
+    """Get .claude directory in current working directory."""
+    return Path.cwd() / ".claude"
+
+
+def load_state(claude_dir: Path) -> dict:
+    """Load session state from file."""
+    state_file = claude_dir / ".session-state.json"
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def count_activity(claude_dir: Path) -> tuple:
+    """Count activity and get session times from today's log."""
+    activity_file = claude_dir / "activity.jsonl"
+    counts = {"edits": 0, "writes": 0, "reads": 0, "commands": 0, "tasks": 0, "other": 0}
+    files_touched = set()
+    session_start = None
+    session_end = None
+
+    if not activity_file.exists():
+        return counts, files_touched, "", ""
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    with open(activity_file) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if not entry.get("timestamp", "").startswith(today):
+                    continue
+
+                time_local = entry.get("time_local", "")
+                if session_start is None:
+                    session_start = time_local
+                session_end = time_local
+
+                tool = entry.get("tool", "")
+                if tool in ("Edit", "MultiEdit"):
+                    counts["edits"] += 1
+                elif tool == "Write":
+                    counts["writes"] += 1
+                elif tool == "Read":
+                    counts["reads"] += 1
+                elif tool == "Bash":
+                    counts["commands"] += 1
+                elif tool in ("TaskUpdate", "TaskCreate"):
+                    counts["tasks"] += 1
+                else:
+                    counts["other"] += 1
+
+                if "file" in entry:
+                    file_path = entry["file"]
+                    try:
+                        file_path = str(Path(file_path).relative_to(Path.cwd()))
+                    except ValueError:
+                        pass
+                    files_touched.add(file_path)
+            except json.JSONDecodeError:
+                continue
+
+    return counts, files_touched, session_start or "", session_end or ""
+
+
+def generate_session_summary(counts: dict, files: set, start: str, end: str, state: dict) -> str:
+    """Generate a session summary block."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    total_actions = sum(counts.values())
+    if total_actions == 0:
+        return ""
+
+    # Files summary
+    files_list = ", ".join(sorted(files)[:5])
+    if len(files) > 5:
+        files_list += f" (+{len(files) - 5} more)"
+
+    # Tasks completed
+    tasks_section = ""
+    completed_tasks = state.get("completed_tasks", [])
+    if completed_tasks:
+        tasks_section = "\n  - Tasks: " + ", ".join(
+            t.get("subject", f"#{t['id']}") for t in completed_tasks[-3:]
+        )
+
+    # Milestones
+    milestones_section = ""
+    milestones = state.get("milestones", [])
+    if milestones:
+        milestones_section = "\n  - Milestones: " + ", ".join(
+            m["description"] for m in milestones[-3:]
+        )
+
+    return f"""### {today} ({start} - {end})
+- **Actions:** {total_actions} (Edits: {counts['edits']}, Writes: {counts['writes']}, Commands: {counts['commands']}, Tasks: {counts['tasks']})
+- **Files:** {files_list or "(none)"}{tasks_section}{milestones_section}
+"""
+
+
+def update_status(claude_dir: Path, session_summary: str):
+    """Update STATUS.md with new session summary."""
+    status_file = claude_dir / "STATUS.md"
+
+    if status_file.exists():
+        existing = status_file.read_text()
+    else:
+        existing = ""
+
+    # Check if we already have a header
+    if existing.startswith("# Project Status"):
+        # Insert new session after "## Session History"
+        lines = existing.split("\n")
+        header_end = 0
+        for i, line in enumerate(lines):
+            if line.startswith("## Session History"):
+                header_end = i + 1
+                break
+
+        if header_end > 0:
+            # Insert after "## Session History"
+            new_content = "\n".join(lines[:header_end]) + "\n\n" + session_summary + "\n".join(lines[header_end:])
+        else:
+            # No session history section yet, add it
+            new_content = existing.rstrip() + "\n\n## Session History\n\n" + session_summary
+    else:
+        # Create new status file
+        new_content = f"""# Project Status
+
+*Auto-generated by Claude Code hooks. Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M")}*
+
+## Session History
+
+{session_summary}"""
+
+    status_file.write_text(new_content)
+
+
+def archive_activity_log(claude_dir: Path):
+    """Archive today's activity log to logs directory."""
+    activity_file = claude_dir / "activity.jsonl"
+    if not activity_file.exists():
+        return
+
+    logs_dir = claude_dir / "logs"
+    logs_dir.mkdir(exist_ok=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    archive_file = logs_dir / f"activity-{today}.jsonl"
+
+    # Append to existing archive
+    with open(activity_file) as src:
+        content = src.read()
+
+    if content.strip():
+        with open(archive_file, "a") as dst:
+            dst.write(content)
+
+    # Clear the main activity file
+    activity_file.write_text("")
+
+
+def reset_session_state(claude_dir: Path):
+    """Reset session state files."""
+    state_file = claude_dir / ".session-state.json"
+    if state_file.exists():
+        state_file.unlink()
+
+    counter_file = claude_dir / ".action-count"
+    if counter_file.exists():
+        counter_file.unlink()
+
+
+def run_git_auto():
+    """Run git auto-commit if enabled."""
+    if os.environ.get("GIT_AUTO_COMMIT") != "1":
+        return None
+
+    try:
+        # Import and run git-auto
+        script_dir = Path(__file__).parent
+        git_script = script_dir / "git-auto.py"
+
+        if git_script.exists():
+            result = subprocess.run(
+                ["python3", str(git_script)],
+                input="{}",
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.stdout:
+                try:
+                    return json.loads(result.stdout)
+                except:
+                    pass
+    except Exception:
+        pass
+
+    return None
+
+
+def main():
+    try:
+        # Read input from stdin (may contain session info)
+        try:
+            input_data = json.load(sys.stdin)
+        except json.JSONDecodeError:
+            input_data = {}
+
+        claude_dir = get_claude_dir()
+
+        if not claude_dir.exists():
+            print(json.dumps({}))
+            sys.exit(0)
+
+        # Load session state
+        state = load_state(claude_dir)
+
+        # Generate session summary from activity log
+        counts, files, start, end = count_activity(claude_dir)
+        session_summary = generate_session_summary(counts, files, start, end, state)
+
+        messages = []
+
+        if session_summary:
+            # Update STATUS.md
+            update_status(claude_dir, session_summary)
+
+            # Build detailed summary
+            task_count = len(state.get("completed_tasks", []))
+            milestone_count = len(state.get("milestones", []))
+
+            summary_parts = [f"{sum(counts.values())} actions"]
+            if task_count:
+                summary_parts.append(f"{task_count} tasks completed")
+            if milestone_count:
+                summary_parts.append(f"{milestone_count} milestones")
+
+            messages.append(f"📝 Session saved → .claude/STATUS.md ({', '.join(summary_parts)})")
+
+            # Archive and clear activity log
+            archive_activity_log(claude_dir)
+
+            # Reset session state
+            reset_session_state(claude_dir)
+
+        # Run git auto-commit if enabled
+        git_result = run_git_auto()
+        if git_result and git_result.get("systemMessage"):
+            messages.append(git_result["systemMessage"])
+
+        # Output result
+        if messages:
+            print(json.dumps({"systemMessage": " | ".join(messages)}))
+        else:
+            print(json.dumps({}))
+
+    except Exception as e:
+        print(json.dumps({"systemMessage": f"Status updater: {e}"}))
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
